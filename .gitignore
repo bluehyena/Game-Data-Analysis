@@ -1,0 +1,6 @@
+*.csv
+*.npz
+*.json
+.idea
+*.txt
+*.ttf
