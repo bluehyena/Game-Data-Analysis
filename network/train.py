@@ -14,17 +14,14 @@ from datetime import datetime
 import numpy as np
 import random
 from tqdm import tqdm
-import MeCab
 
-from model import get_pad_mask, get_subsequent_mask, get_clipped_adj_matrix
 from model import Transformer
 from dataloader import NickNameDataset
-from test import make_upper_follow_lower_torch_padded
 
 import wandb
 
 class Trainer:
-    def __init__(self, batch_size, max_epoch, sos_idx, eos_idx, pad_idx, d_model, n_layer, n_head,
+    def __init__(self, batch_size, max_epoch,
                  dropout, use_checkpoint, checkpoint_epoch, use_tensorboard,
                  val_epoch, save_epoch, lr, local_rank, save_dir_path):
         """
@@ -42,12 +39,6 @@ class Trainer:
         # Initialize trainer parameters
         self.batch_size = batch_size
         self.max_epoch = max_epoch
-        self.sos_idx = sos_idx
-        self.pad_idx = pad_idx
-        self.eos_idx = eos_idx
-        self.d_model = d_model
-        self.n_layer = n_layer
-        self.n_head = n_head
         self.dropout = dropout
         self.use_checkpoint = use_checkpoint
         self.checkpoint_epoch = checkpoint_epoch
@@ -76,10 +67,7 @@ class Trainer:
                                          sampler=self.val_sampler, num_workers=8, pin_memory=True)
 
         # Initialize the Transformer model
-        self.transformer = Transformer(sos_idx=self.sos_idx, eos_idx=self.eos_idx, pad_idx=self.pad_idx,
-                                            d_model=self.d_model,
-                                            d_inner=self.d_model * 4, n_layer=self.n_layer, n_head=self.n_head,
-                                            dropout=self.dropout).to(device=self.device)
+        self.transformer = Transformer().to(device=self.device)
         self.transformer = nn.parallel.DistributedDataParallel(self.transformer, device_ids=[local_rank])
 
         # optimizer
@@ -111,21 +99,6 @@ class Trainer:
         Returns:
         - torch.Tensor: Computed BCE loss.
         """
-        loss = F.binary_cross_entropy(torch.sigmoid(pred[:, :-1]), get_clipped_adj_matrix(trg[:, 1:]), reduction='none')
-
-        # pad_idx에 해당하는 레이블을 무시하기 위한 mask 생성
-        pad_mask = get_pad_mask(trg[:, 1:, 0], pad_idx=self.pad_idx).unsqueeze(-1).expand(-1, -1, loss.shape[2])
-        sub_mask = get_subsequent_mask(trg[:, :, 0])[:, 1:, :]
-        sos_mask = torch.ones_like(sub_mask).to(device=sub_mask.device)
-        sos_mask[:, :, 0] = 0
-        identity_mask = torch.eye(trg.shape[1]).unsqueeze(0).expand(loss.shape[0], -1, -1).to(device=sub_mask.device)
-        identity_mask = 1 - identity_mask[:, 1:, :]
-        mask = pad_mask & sub_mask & sos_mask.bool() & identity_mask.bool()
-
-        # mask 적용
-        masked_loss = loss * mask.float()
-        # 손실의 평균 반환
-        return masked_loss.sum() / mask.float().sum()
 
     def train(self):
         """Training loop for the transformer model."""
@@ -151,21 +124,15 @@ class Trainer:
                 self.optimizer.zero_grad()
 
                 # Get the source and target sequences from the batch
-                src_unit_seq, src_street_seq, street_index_seq, trg_adj_seq, cur_n_street, cur_n_node = data
-                gt_adj_seq = trg_adj_seq.to(device=self.device)
-                src_unit_seq = src_unit_seq.to(device=self.device)
-                src_street_seq = src_street_seq.to(device=self.device)
-                street_index_seq = street_index_seq.to(device=self.device)
-                trg_adj_seq = trg_adj_seq.to(device=self.device)
-                cur_n_street = cur_n_street.to(device=self.device)
-                cur_n_node = cur_n_node.to(device=self.device)
+                seq, label = data
+                seq = seq.to(device=self.device)
+                label = label.to(device=self.device)
 
                 # Get the model's predictions
-                output = self.transformer(src_unit_seq, src_street_seq, street_index_seq, trg_adj_seq,
-                                          cur_n_street, cur_n_node)
+                output = self.transformer(seq)
 
                 # Compute the losses
-                loss = self.cross_entropy_loss(output, gt_adj_seq.detach())
+                loss = self.cross_entropy_loss(output, label.detach())
                 loss_total = loss
 
                 # Backpropagation and optimization step
@@ -193,32 +160,15 @@ class Trainer:
                     # Iterate over batches
                     for data in tqdm(self.val_dataloader):
                         # Get the source and target sequences from the batch
-                        src_unit_seq, src_street_seq, street_index_seq, trg_adj_seq, cur_n_street, cur_n_node = data
-                        gt_adj_seq = trg_adj_seq.to(device=self.device, dtype=torch.float32)
-                        src_unit_seq = src_unit_seq.to(device=self.device, dtype=torch.float32)
-                        src_street_seq = src_street_seq.to(device=self.device, dtype=torch.float32)
-                        street_index_seq = street_index_seq.to(device=self.device, dtype=torch.long)
-                        trg_adj_seq = trg_adj_seq.to(device=self.device, dtype=torch.float32)
-                        cur_n_street = cur_n_street.to(device=self.device, dtype=torch.long)
-                        cur_n_node = cur_n_node.to(device=self.device)
+                        seq, label = data
+                        seq = seq.to(device=self.device)
+                        label = label.to(device=self.device)
 
-                        # Greedy Search로 시퀀스 생성
-                        decoder_input = trg_adj_seq[:, :cur_n_street[0] + 1]  # 시작 토큰만 포함
-
-                        # output 값을 저장할 텐서를 미리 할당합니다.
-                        output_storage = torch.zeros_like(trg_adj_seq, device=self.device)
-
-                        for t in range(cur_n_street[0], gt_adj_seq.shape[1] - 1):  # 임의의 제한값
-                            output = self.transformer(src_unit_seq, src_street_seq, street_index_seq, decoder_input,
-                                                      cur_n_street, cur_n_node)
-                            output_storage[:, t] = output[:, t].detach()
-                            next_token = (torch.sigmoid(output) > 0.5).long()[:, t].unsqueeze(-2)
-                            decoder_input = torch.cat([decoder_input, next_token], dim=1)
-                            decoder_input = make_upper_follow_lower_torch_padded(decoder_input)
-                            decoder_input[:, :1] = trg_adj_seq[:, :1]
+                        # Get the model's predictions
+                        output = self.transformer(seq)
 
                         # Compute the losses using the generated sequence
-                        loss = self.cross_entropy_loss(output_storage, gt_adj_seq)
+                        loss = self.cross_entropy_loss(output, label)
 
                         # 모든 GPU에서 손실 값을 합산 <-- 추가된 부분
                         dist.all_reduce(loss, op=dist.ReduceOp.SUM)
@@ -256,12 +206,6 @@ if __name__ == '__main__':
     # Define the arguments with their descriptions
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
     parser.add_argument("--max_epoch", type=int, default=200, help="Maximum number of epochs for training.")
-    parser.add_argument("--sos_idx", type=int, default=2, help="Padding index for sequences.")
-    parser.add_argument("--eos_idx", type=int, default=3, help="Padding index for sequences.")
-    parser.add_argument("--pad_idx", type=int, default=4, help="Padding index for sequences.")
-    parser.add_argument("--d_model", type=int, default=512, help="Dimension of the model.")
-    parser.add_argument("--n_layer", type=int, default=6, help="Number of transformer layers.")
-    parser.add_argument("--n_head", type=int, default=8, help="Number of attention heads.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate used in the transformer model.")
     parser.add_argument("--seed", type=int, default=327, help="Random seed for reproducibility across runs.")
     parser.add_argument("--use_tensorboard", type=bool, default=True, help="Use tensorboard.")
@@ -269,7 +213,7 @@ if __name__ == '__main__':
     parser.add_argument("--checkpoint_epoch", type=int, default=0, help="Use checkpoint index.")
     parser.add_argument("--val_epoch", type=int, default=1, help="Use checkpoint index.")
     parser.add_argument("--save_epoch", type=int, default=10, help="Use checkpoint index.")
-    parser.add_argument("--local_rank", type=int)
+    parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--save_dir_path", type=str, default="transformer", help="save dir path")
     parser.add_argument("--lr", type=float, default=3e-5, help="save dir path")
 
@@ -314,12 +258,9 @@ if __name__ == '__main__':
             dist.init_process_group('nccl')
 
     # Create a Trainer instance and start the training process
-    trainer = Trainer(batch_size=opt.batch_size, max_epoch=opt.max_epoch, sos_idx=opt.sos_idx, eos_idx=opt.eos_idx, pad_idx=opt.pad_idx,
-                      d_street=opt.d_street, d_unit=opt.d_unit, d_model=opt.d_model, n_layer=opt.n_layer, n_head=opt.n_head,
-                      n_building=opt.n_building, n_boundary=opt.n_boundary, use_tensorboard=opt.use_tensorboard,
+    trainer = Trainer(batch_size=opt.batch_size, max_epoch=opt.max_epoch, use_tensorboard=opt.use_tensorboard,
                       dropout=opt.dropout, use_checkpoint=opt.use_checkpoint, checkpoint_epoch=opt.checkpoint_epoch,
-                      val_epoch=opt.val_epoch, save_epoch=opt.save_epoch, n_street=opt.n_street, lr=opt.lr,
-                      use_global_attn=opt.use_global_attn, use_street_attn=opt.use_street_attn, use_local_attn=opt.use_local_attn,
+                      val_epoch=opt.val_epoch, save_epoch=opt.save_epoch, lr=opt.lr,
                       local_rank=opt.local_rank, save_dir_path=opt.save_dir_path)
 
     trainer.train()

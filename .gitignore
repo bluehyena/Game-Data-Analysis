@@ -4,3 +4,5 @@
 .idea
 *.txt
 *.ttf
+network/wandb
+*.zip
