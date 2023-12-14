@@ -1,9 +1,6 @@
 import torch
 from torch.utils.data import Dataset
-import networkx as nx
 import numpy as np
-import pickle
-import os
 from transformers import AutoTokenizer
 
 
@@ -14,12 +11,12 @@ class NickNameDataset(Dataset):
         self.tokenizer = AutoTokenizer.from_pretrained('skt/kobert-base-v1')
         self.data_type = data_type
 
-        self.file_path = '../data/preprocessing.npz'
+        self.file_path = '../data/preprocessed.npz'
         self.data = np.load(self.file_path)
         self.data_length = len(self.data['names'])
         print(self.data_length)
 
-    def get(self, idx):
+    def __getitem__(self, idx):
         name = self.data['names'][idx]
         label = self.data['labels'][idx]
 
@@ -27,9 +24,12 @@ class NickNameDataset(Dataset):
             label = 1
 
         output = self.tokenizer.encode(name, add_special_tokens=False)
-        output = [self.tokenizer.bos_token_id] + output + [self.tokenizer.eos_token_id]
+        output = [self.tokenizer.bos_token_id] + output + [self.tokenizer.eos_token_id] + [self.tokenizer.pad_token_id] * (500 - len(output))
+
+        output = torch.tensor(output, dtype=torch.long)
+        label = torch.tensor([label], dtype=torch.float32)
 
         return output, label
 
-    def len(self):
+    def __len__(self):
         return self.data_length

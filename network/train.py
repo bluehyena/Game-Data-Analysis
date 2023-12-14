@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers.optimization import AdamW, get_cosine_schedule_with_warmup
-import torch.distributed as dist
 from datetime import datetime
 
 import numpy as np
@@ -23,7 +22,7 @@ import wandb
 class Trainer:
     def __init__(self, batch_size, max_epoch,
                  dropout, use_checkpoint, checkpoint_epoch, use_tensorboard,
-                 val_epoch, save_epoch, lr, local_rank, save_dir_path):
+                 val_epoch, save_epoch, lr, save_dir_path):
         """
         Initialize the trainer with the specified parameters.
 
@@ -45,30 +44,22 @@ class Trainer:
         self.use_tensorboard = use_tensorboard
         self.val_epoch = val_epoch
         self.save_epoch = save_epoch
-        self.local_rank = local_rank
         self.save_dir_path = save_dir_path
         self.lr = lr
 
-        print('local_rank', self.local_rank)
-
         # Set the device for training (either GPU or CPU based on availability)
-        self.device = torch.device(f'cuda:{self.local_rank}') if torch.cuda.is_available() else torch.device('cpu')
+        self.device = torch.device(f'cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
         # Only the first dataset initialization will load the full dataset from disk
         self.train_dataset = NickNameDataset(data_type='train')
-        self.train_sampler = torch.utils.data.DistributedSampler(dataset=self.train_dataset, rank=rank)
-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=False,
-                                           sampler=self.train_sampler, num_workers=8, pin_memory=True)
+        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
 
         # Subsequent initializations will use the already loaded full dataset
         self.val_dataset = NickNameDataset(data_type='val')
-        self.val_sampler = torch.utils.data.DistributedSampler(dataset=self.val_dataset, rank=rank)
-        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
-                                         sampler=self.val_sampler, num_workers=8, pin_memory=True)
+        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True)
 
         # Initialize the Transformer model
         self.transformer = Transformer().to(device=self.device)
-        self.transformer = nn.parallel.DistributedDataParallel(self.transformer, device_ids=[local_rank])
 
         # optimizer
         param_optimizer = list(self.transformer.named_parameters())
@@ -100,6 +91,19 @@ class Trainer:
         - torch.Tensor: Computed BCE loss.
         """
 
+        criterion = nn.BCELoss()
+        loss = criterion(pred, trg)
+
+        return loss
+
+    def get_accuracy(self, pred, trg):
+        pred = pred > 0.5
+        return (trg == pred).sum().item() / trg.size(0)
+
+    def get_true_accuracy(self, pred, trg):
+        pred = pred > 0.5
+        return str(pred.sum().item()) + ' / ' + str(trg.sum().item())
+
     def train(self):
         """Training loop for the transformer model."""
         epoch_start = 0
@@ -112,12 +116,9 @@ class Trainer:
 
         if self.use_tensorboard:
             self.writer = SummaryWriter()
-            if self.local_rank == 0:
-                wandb.watch(self.transformer.module, log='all')  # <--- 추가된 부분
+            wandb.watch(self.transformer, log='all')  # <--- 추가된 부분
 
         for epoch in range(epoch_start, self.max_epoch):
-            total_loss = torch.Tensor([0.0]).to(self.device)  # <--- 추가된 부분
-
             # Iterate over batches
             for data in tqdm(self.train_dataloader):
                 # Zero the gradients
@@ -140,21 +141,18 @@ class Trainer:
                 self.optimizer.step()
                 self.scheduler.step()
 
-                # 모든 GPU에서 손실 값을 합산 <-- 수정된 부분
-                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                total_loss += loss
+                print(f'accuracy: {self.get_accuracy(output.detach(), label.detach())}')
+                print(f'accuracy: {self.get_true_accuracy(output.detach(), label.detach())}')
 
                 # 첫 번째 GPU에서만 평균 손실을 계산하고 출력 <-- 수정된 부분
-            if self.local_rank == 0:
-                loss_mean = total_loss.item() / (len(self.train_dataloader) * dist.get_world_size())
-                print(f"Epoch {epoch + 1}/{self.max_epoch} - Loss BCE: {loss_mean:.4f}")
+            loss_mean = loss_total.detach() / (len(self.train_dataloader) )
+            print(f"Epoch {epoch + 1}/{self.max_epoch} - Loss BCE: {loss_mean:.4f}")
 
-                if self.use_tensorboard:
-                    wandb.log({"Train bce loss": loss_mean}, step=epoch + 1)
+            if self.use_tensorboard:
+                wandb.log({"Train bce loss": loss_mean}, step=epoch + 1)
 
             if (epoch + 1) % self.val_epoch == 0:
-                self.transformer.module.eval()
-                total_val_loss = torch.tensor([0.0], device=self.device)  # <--- 추가된 부분
+                self.transformer.eval()
 
                 with torch.no_grad():
                     # Iterate over batches
@@ -170,36 +168,30 @@ class Trainer:
                         # Compute the losses using the generated sequence
                         loss = self.cross_entropy_loss(output, label)
 
-                        # 모든 GPU에서 손실 값을 합산 <-- 추가된 부분
-                        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                        total_val_loss += loss
+                    val_loss_mean = loss.detach() / (len(self.val_dataloader))
+                    print(f"Epoch {epoch + 1}/{self.max_epoch} - Validation Loss BCE: {val_loss_mean:.4f}")
 
-                        # 첫 번째 GPU에서만 평균 손실을 계산하고 출력 <-- 추가된 부분
-                    if self.local_rank == 0:
-                        val_loss_mean = total_val_loss.item() / (len(self.val_dataloader) * dist.get_world_size())
-                        print(f"Epoch {epoch + 1}/{self.max_epoch} - Validation Loss BCE: {val_loss_mean:.4f}")
+                    if self.use_tensorboard:
+                        wandb.log({"Val bce loss": val_loss_mean}, step=epoch + 1)
 
-                        if self.use_tensorboard:
-                            wandb.log({"Val bce loss": val_loss_mean}, step=epoch + 1)
-
-                self.transformer.module.train()
+                self.transformer.train()
 
             if (epoch + 1) % self.save_epoch == 0:
                 # 체크포인트 데이터 준비
                 checkpoint = {
                     'epoch': epoch,
-                    'model_state_dict': self.transformer.module.state_dict(),
+                    'model_state_dict': self.transformer.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                 }
 
-                if self.local_rank == 0:
-                    save_path = os.path.join("./models", self.save_dir_path)
-                    if not os.path.exists(save_path):
-                        os.makedirs(save_path)
-                    torch.save(checkpoint, os.path.join(save_path, "transformer_epoch_" + str(epoch + 1) + ".pth"))
+                save_path = os.path.join("./models", self.save_dir_path)
+                if not os.path.exists(save_path):
+                    os.makedirs(save_path)
+                torch.save(checkpoint, os.path.join(save_path, "transformer_epoch_" + str(epoch + 1) + ".pth"))
 
 
 if __name__ == '__main__':
+
     # Set the argparse
     parser = argparse.ArgumentParser(description="Initialize a transformer with user-defined hyperparameters.")
 
@@ -212,8 +204,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_checkpoint", type=bool, default=False, help="Use checkpoint model.")
     parser.add_argument("--checkpoint_epoch", type=int, default=0, help="Use checkpoint index.")
     parser.add_argument("--val_epoch", type=int, default=1, help="Use checkpoint index.")
-    parser.add_argument("--save_epoch", type=int, default=10, help="Use checkpoint index.")
-    parser.add_argument("--local_rank", type=int)
+    parser.add_argument("--save_epoch", type=int, default=1, help="Use checkpoint index.")
     parser.add_argument("--save_dir_path", type=str, default="transformer", help="save dir path")
     parser.add_argument("--lr", type=float, default=3e-5, help="save dir path")
 
@@ -222,45 +213,34 @@ if __name__ == '__main__':
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     opt.save_dir_path = f"{opt.save_dir_path}_{current_time}"
 
-    if opt.local_rank == 0:
-        wandb.login(key='5a8475b9b95df52a68ae430b3491fe9f67c327cd')
-        wandb.init(project=opt.save_dir_path, config=vars(opt))
+    wandb.login(key='0f272b4978c0b450c3765b24b8abd024d7799e80')
+    wandb.init(project='transformer', entity='ssw03270', config=vars(opt))
 
-        for key, value in wandb.config.items():
-            setattr(opt, key, value)
+    for key, value in wandb.config.items():
+        setattr(opt, key, value)
 
-    if opt.local_rank == 0:
-        save_path = os.path.join("./models", opt.save_dir_path)
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
+    save_path = os.path.join("./models", opt.save_dir_path)
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
 
-        config_file_path = os.path.join(save_path, "config.txt")
-        with open(config_file_path, "w") as f:
-            for arg in vars(opt):
-                f.write(f"{arg}: {getattr(opt, arg)}\n")
-
-    if opt.local_rank == 0:
+    config_file_path = os.path.join(save_path, "config.txt")
+    with open(config_file_path, "w") as f:
         for arg in vars(opt):
-            print(f"{arg}: {getattr(opt, arg)}")
+            f.write(f"{arg}: {getattr(opt, arg)}\n")
+
+    for arg in vars(opt):
+        print(f"{arg}: {getattr(opt, arg)}")
 
     random.seed(opt.seed)
     np.random.seed(opt.seed)
     torch.manual_seed(opt.seed)
     torch.cuda.manual_seed_all(opt.seed)
 
-    rank = opt.local_rank
-    torch.cuda.set_device(rank)
-    if not dist.is_initialized():
-        if torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu') == "cuda:0":
-            dist.init_process_group("gloo")
-
-        else:
-            dist.init_process_group('nccl')
-
     # Create a Trainer instance and start the training process
     trainer = Trainer(batch_size=opt.batch_size, max_epoch=opt.max_epoch, use_tensorboard=opt.use_tensorboard,
                       dropout=opt.dropout, use_checkpoint=opt.use_checkpoint, checkpoint_epoch=opt.checkpoint_epoch,
-                      val_epoch=opt.val_epoch, save_epoch=opt.save_epoch, lr=opt.lr,
-                      local_rank=opt.local_rank, save_dir_path=opt.save_dir_path)
+                      val_epoch=opt.val_epoch, save_epoch=opt.save_epoch, lr=opt.lr, save_dir_path=opt.save_dir_path)
 
     trainer.train()
+
+    wandb.finish()

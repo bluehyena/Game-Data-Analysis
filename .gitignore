@@ -6,3 +6,6 @@
 *.ttf
 network/wandb
 *.zip
+network/runs
+*.pth
+*.tsv

@@ -10,8 +10,8 @@ class Transformer(nn.Module):
         self.fc = nn.Linear(768, 1)
 
     def forward(self, x):
-        x = self.model(x)
+        x = self.model(x)['last_hidden_state'][:, 0]
         x = self.fc(x)
-        x = nn.Sigmoid(x)
+        x = torch.sigmoid(x)
 
         return x
