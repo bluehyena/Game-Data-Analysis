@@ -219,7 +219,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_checkpoint", type=bool, default=False, help="Use checkpoint model.")
     parser.add_argument("--checkpoint_epoch", type=int, default=0, help="Use checkpoint index.")
     parser.add_argument("--val_epoch", type=int, default=200, help="Use checkpoint index.")
-    parser.add_argument("--save_epoch", type=int, default=10, help="Use checkpoint index.")
+    parser.add_argument("--save_epoch", type=int, default=1, help="Use checkpoint index.")
     parser.add_argument("--save_dir_path", type=str, default="transformer", help="save dir path")
     parser.add_argument("--lr", type=float, default=3e-5, help="save dir path")
 
