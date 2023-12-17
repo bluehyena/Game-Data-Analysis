@@ -51,12 +51,8 @@ class Trainer:
         self.device = torch.device(f'cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
         # Only the first dataset initialization will load the full dataset from disk
-        self.train_dataset = NickNameDataset(data_type='train')
-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
-
-        # Subsequent initializations will use the already loaded full dataset
-        self.val_dataset = NickNameDataset(data_type='val')
-        self.val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True)
+        self.test_dataset = NickNameDataset(data_type='train')
+        self.test_dataloader = DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=True)
 
         # Initialize the Transformer model
         self.transformer = Transformer().to(device=self.device)
@@ -73,7 +69,7 @@ class Trainer:
         self.optimizer = AdamW(optimizer_grouped_parameters, lr=self.lr, correct_bias=False, no_deprecation_warning=True)
 
         # scheduler
-        data_len = len(self.train_dataloader)
+        data_len = len(self.test_dataloader)
         num_train_steps = int(data_len / batch_size * self.max_epoch)
         num_warmup_steps = int(num_train_steps * 0.1)
         self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps=num_warmup_steps,
@@ -106,103 +102,28 @@ class Trainer:
 
     def train(self):
         """Training loop for the transformer model."""
-        epoch_start = 0
 
-        if self.use_checkpoint:
-            checkpoint = torch.load("./models/transformer_epoch_" + str(self.checkpoint_epoch) + ".pt")
-            self.transformer.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            epoch_start = checkpoint['epoch']
+        checkpoint = torch.load("./models/transformer_20231215_184058/transformer_epoch_" + str(self.checkpoint_epoch) + ".pth")
+        self.transformer.load_state_dict(checkpoint['model_state_dict'])
 
-        if self.use_tensorboard:
-            self.writer = SummaryWriter()
-            wandb.watch(self.transformer, log='all')  # <--- 추가된 부분
+        self.transformer.eval()
 
-        for epoch in range(epoch_start, self.max_epoch):
-            loss_sum = 0
+        with torch.no_grad():
             true_sum = 0
             # Iterate over batches
-            for data in tqdm(self.train_dataloader):
-                # Zero the gradients
-                self.optimizer.zero_grad()
-
+            for data in tqdm(self.test_dataloader):
                 # Get the source and target sequences from the batch
-                text, image, label, _ = data
-                text = text.to(device=self.device)
+                seq, image, label, name = data
+                seq = seq.to(device=self.device)
                 label = label.to(device=self.device)
-                image = image.to(device=self.device)
 
                 # Get the model's predictions
-                output = self.transformer(text, image)
-
-                # Compute the losses
-                loss = self.cross_entropy_loss(output, label.detach())
-
-                # Backpropagation and optimization step
-                loss.backward()
-                self.optimizer.step()
-                self.scheduler.step()
-
-                loss_sum += loss.detach()
+                output = self.transformer(seq)
+                print(name, label, output)
                 true_sum += self.get_accuracy(output, label)
 
-                # 첫 번째 GPU에서만 평균 손실을 계산하고 출력 <-- 수정된 부분
-            loss_mean = loss_sum / (len(self.train_dataloader))
-            true_mean = true_sum / self.train_dataset.data_length
-            print(f"Epoch {epoch + 1}/{self.max_epoch} - Loss BCE: {loss_mean:.4f}")
-            print(f"Epoch {epoch + 1}/{self.max_epoch} - accuracy: {true_mean:.4f}")
-
-            if self.use_tensorboard:
-                wandb.log({"Train bce loss": loss_mean}, step=epoch + 1)
-                wandb.log({"Train accuracy": true_mean}, step=epoch + 1)
-
-            if (epoch + 1) % self.val_epoch == 0:
-                self.transformer.eval()
-
-                with torch.no_grad():
-                    loss_sum = 0
-                    true_sum = 0
-
-                    # Iterate over batches
-                    for data in tqdm(self.val_dataloader):
-                        # Get the source and target sequences from the batch
-                        text, image, label, _ = data
-                        text = text.to(device=self.device)
-                        label = label.to(device=self.device)
-                        image = image.to(device=self.device)
-
-                        # Get the model's predictions
-                        output = self.transformer(text, image)
-
-                        # Compute the losses using the generated sequence
-                        loss = self.cross_entropy_loss(output, label)
-
-                        loss_sum += loss.detach()
-                        true_sum += self.get_accuracy(output, label)
-
-                    val_loss_mean = loss_sum / (len(self.val_dataloader))
-                    val_true_mean = true_sum / self.val_dataset.data_length
-                    print(f"Epoch {epoch + 1}/{self.max_epoch} - Validation Loss BCE: {val_loss_mean:.4f}")
-                    print(f"Epoch {epoch + 1}/{self.max_epoch} - Validation accuracy: {val_true_mean:.4f}")
-
-                    if self.use_tensorboard:
-                        wandb.log({"Val bce loss": val_loss_mean}, step=epoch + 1)
-                        wandb.log({"Val accuracy": true_mean}, step=epoch + 1)
-
-                self.transformer.train()
-
-            if (epoch + 1) % self.save_epoch == 0:
-                # 체크포인트 데이터 준비
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': self.transformer.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                }
-
-                save_path = os.path.join("./models", self.save_dir_path)
-                if not os.path.exists(save_path):
-                    os.makedirs(save_path)
-                torch.save(checkpoint, os.path.join(save_path, "transformer_epoch_" + str(epoch + 1) + ".pth"))
+            test_true_mean = true_sum / self.test_dataset.data_length
+            print(f"Test accuracy: {test_true_mean:.4f}")
 
 
 if __name__ == '__main__':
@@ -211,15 +132,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Initialize a transformer with user-defined hyperparameters.")
 
     # Define the arguments with their descriptions
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training.")
     parser.add_argument("--max_epoch", type=int, default=200, help="Maximum number of epochs for training.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate used in the transformer model.")
     parser.add_argument("--seed", type=int, default=327, help="Random seed for reproducibility across runs.")
     parser.add_argument("--use_tensorboard", type=bool, default=True, help="Use tensorboard.")
     parser.add_argument("--use_checkpoint", type=bool, default=False, help="Use checkpoint model.")
-    parser.add_argument("--checkpoint_epoch", type=int, default=0, help="Use checkpoint index.")
-    parser.add_argument("--val_epoch", type=int, default=200, help="Use checkpoint index.")
-    parser.add_argument("--save_epoch", type=int, default=10, help="Use checkpoint index.")
+    parser.add_argument("--checkpoint_epoch", type=int, default=30, help="Use checkpoint index.")
+    parser.add_argument("--val_epoch", type=int, default=1, help="Use checkpoint index.")
+    parser.add_argument("--save_epoch", type=int, default=1, help="Use checkpoint index.")
     parser.add_argument("--save_dir_path", type=str, default="transformer", help="save dir path")
     parser.add_argument("--lr", type=float, default=3e-5, help="save dir path")
 
@@ -227,12 +148,6 @@ if __name__ == '__main__':
 
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     opt.save_dir_path = f"{opt.save_dir_path}_{current_time}"
-
-    wandb.login(key='0f272b4978c0b450c3765b24b8abd024d7799e80')
-    wandb.init(project='transformer', entity='ssw03270', config=vars(opt), name=opt.save_dir_path)
-
-    for key, value in wandb.config.items():
-        setattr(opt, key, value)
 
     save_path = os.path.join("./models", opt.save_dir_path)
     if not os.path.exists(save_path):
@@ -257,5 +172,3 @@ if __name__ == '__main__':
                       val_epoch=opt.val_epoch, save_epoch=opt.save_epoch, lr=opt.lr, save_dir_path=opt.save_dir_path)
 
     trainer.train()
-
-    wandb.finish()

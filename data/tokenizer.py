@@ -1,7 +1,7 @@
 import numpy as np
 
 # NSMC 데이터 로드
-file_path = 'preprocessed.npz'
+file_path = 'train_preprocessed.npz'
 data = np.load(file_path)
 
 #  문장 및 라벨 데이터 추출

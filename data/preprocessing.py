@@ -28,7 +28,7 @@ if __name__ == "__main__":
             print(tier, rank)
 
             warnings.filterwarnings('ignore')
-            directory = f"{tier}/{rank}"
+            directory = f"val/{tier}/{rank}"
             try:
                 file_list = os.listdir(directory)
             except:
@@ -44,31 +44,35 @@ if __name__ == "__main__":
 
                     summoner_names += data_df['summonerName'].tolist()
                     try:
-                        labels += data_df['label'].tolist()
+                        labels += data_df['label'].apply(lambda x: 1 if x > 1 else x).tolist()
                     except:
                         print(file_path)
                 else:
                     data_df = pd.read_csv(file_path, delimiter='\t')
-                    summoner_names += data_df['문장'].tolist()
-                    labels += (1 - data_df['clean']).tolist()
-            # for name in tqdm(summoner_names):
-            #     text_width = 16 * 4
-            #     text_height = 16 * 4
-            #     canvas = Image.new('RGB', (text_width, text_height), "black")
-            #
-            #     # 가운데에 그리기 (폰트 색: 하양)
-            #     draw = ImageDraw.Draw(canvas)
-            #     font_size = 16
-            #     font = ImageFont.truetype("./NanumGothic-Regular.ttf", font_size)
-            #     for i in range(len(name)):
-            #         for j in range(i, i + 4):
-            #             if len(name) < i:
-            #                 continue
-            #             else:
-            #                 draw.text((i % 4 * 16, i // 4 * 16 - 2), name[i], 'white', font)
-            #
-            #     image = np.array(list(canvas.getdata()))
-            #     image = image.reshape((text_height, text_width, 3))
-            #     images.append(image)
+                    for name, label in zip(data_df['문장'], data_df['clean']):
+                        if len(name) <= 16:
+                            summoner_names.append(name)
+                            labels.append(1 - label)
 
-    np.savez('preprocessed', names=summoner_names, labels=labels)
+    for name in tqdm(summoner_names):
+        text_width = 16 * 4
+        text_height = 16 * 4
+        canvas = Image.new('RGB', (text_width, text_height), "black")
+
+        # 가운데에 그리기 (폰트 색: 하양)
+        draw = ImageDraw.Draw(canvas)
+        font_size = 16
+        font = ImageFont.truetype("./NanumGothic-Regular.ttf", font_size)
+        for i in range(len(name)):
+            for j in range(i, i + 4):
+                if len(name) < i:
+                    continue
+                else:
+                    draw.text((i % 4 * 16, i // 4 * 16 - 2), name[i], 'white', font)
+
+        image = np.array(list(canvas.getdata()))
+        image = image.reshape((text_height, text_width, 3))
+        images.append(image)
+
+    print(sum(labels), len(labels), len(summoner_names))
+    np.savez('preprocessed', names=summoner_names, labels=labels, images=images)
